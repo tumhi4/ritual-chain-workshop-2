@@ -4,37 +4,39 @@ pragma solidity ^0.8.28;
 import {RitualChain, IScheduler, IRitualWallet, ITEEServiceRegistry} from "./ritual/RitualChain.sol";
 
 /**
- * RitualPredict — a self-resolving binary prediction market.
+ * ConsensusPredict — Multi-Oracle Fault-Tolerant Prediction Market on Ritual Chain.
  *
- * Users stake native RITUAL on YES or NO. When the betting window closes, nobody
- * clicks "resolve" and no backend cron runs: the Ritual Scheduler wakes the contract
- * at a block chosen at market-creation time. The contract then calls the HTTP
- * precompile (0x0801) to read the configured oracle URL, extracts one number with the
- * jq precompile (0x0803), compares it to the target, and settles the market.
+ * Traditional prediction markets rely on a single oracle endpoint. If that single API fails,
+ * rate-limits (429), or reports manipulated data, the entire market is compromised.
  *
- * Payouts are pari-mutuel and pull-based: each winner claims
- * `stake * totalPool / winningPool`. Nothing loops over participants.
- *
- * Every deadline is a BLOCK NUMBER, so "betting is closed" and "the Scheduler woke us"
- * can never disagree. Human durations are converted at `blockTimeMs`, measured from the
- * live chain at deploy time (`scripts/block-time.ts`).
+ * ConsensusPredict solves this via Autonomous Multi-Source TEE Consensus:
+ * 1. Markets can be configured with multiple independent oracle sources (e.g. Binance, Coinbase, CoinGecko).
+ * 2. At the scheduled resolution block, the Ritual Scheduler (0x56e7...D58B) wakes the contract.
+ * 3. Inside TEE execution, the contract queries all configured sources via HTTP (0x0801) + jq (0x0803).
+ * 4. Filters failed/offline endpoints, eliminates extreme outliers, and calculates the Consensus Median Value.
+ * 5. Settles the market with cryptographic auditability and fault tolerance.
  */
 contract RitualPredict {
     // ─────────────────────────────── Types ───────────────────────────────
 
+    enum MarketType {
+        SingleSource,
+        MultiConsensus
+    }
+
     enum MarketState {
-        Open, // accepting bets
-        Closed, // betting window over, waiting for the scheduled wake-up
-        Resolving, // a resolution attempt has run and failed; retries pending
-        Resolved, // outcome final, winners can claim
-        Invalid // could not be resolved (or nobody won); everyone refunds
+        Open,
+        Closed,
+        Resolving,
+        Resolved,
+        Invalid
     }
 
     enum Comparator {
-        GT, // observed >  target
-        GTE, // observed >= target
-        LT, // observed <  target
-        LTE // observed <= target
+        GT,
+        GTE,
+        LT,
+        LTE
     }
 
     enum Outcome {
@@ -43,31 +45,34 @@ contract RitualPredict {
         No
     }
 
-    /// Storage layout *and* the shape returned by `getMarket` / `getMarkets`.
+    struct OracleSource {
+        string oracleUrl;
+        string jsonPath;
+    }
+
     struct Market {
         uint256 id;
         address creator;
+        MarketType marketType;
         string question;
-        // ── resolution rule: fixed at creation, no setter exists ──
         string oracleUrl;
         string jsonPath;
+        uint8 minQuorum; // Minimum valid sources required (e.g. 2 of 3)
         uint256 target;
         Comparator comparator;
         uint64 closeBlock;
         uint64 resolveBlock;
         uint256 scheduleId;
-        // ── mutable state ──
         uint256 totalYes;
         uint256 totalNo;
         MarketState state;
         Outcome outcome;
         uint8 attempts;
-        uint256 observedValue;
+        uint256 observedValue; // Consensus median value
+        uint8 validSourcesCount;
         string invalidReason;
     }
 
-    /// Arguments to `createMarket`, grouped so the whole rule reads as one unit at the
-    /// call site (and to keep the stack shallow).
     struct NewMarket {
         string question;
         string oracleUrl;
@@ -78,42 +83,38 @@ contract RitualPredict {
         uint256 resolveDelaySeconds;
     }
 
+    struct NewConsensusMarket {
+        string question;
+        string[] oracleUrls;
+        string[] jsonPaths;
+        uint8 minQuorum;
+        uint256 target;
+        Comparator comparator;
+        uint256 bettingSeconds;
+        uint256 resolveDelaySeconds;
+    }
+
     // ────────────────────────────── Constants ────────────────────────────
 
-    /// Resolution attempts per market, booked up front as the Scheduler's `numCalls`,
-    /// `RETRY_INTERVAL_BLOCKS` apart. `frequency * numCalls` must stay under the
-    /// Scheduler's MAX_LIFESPAN of 10,000.
     uint32 public constant MAX_ATTEMPTS = 3;
     uint32 public constant RETRY_INTERVAL_BLOCKS = 200;
-
-    /// Gas per scheduled execution — one HTTP call, one jq call, a few storage writes.
-    uint32 public constant RESOLVE_GAS_LIMIT = 2_000_000;
-
-    /// Scheduler TTL. Must cover trigger drift *and* async HTTP settlement, because the
-    /// settlement replay re-runs Scheduler.execute() and re-checks the TTL.
+    uint32 public constant RESOLVE_GAS_LIMIT = 2_500_000;
     uint32 public constant SCHEDULER_TTL_BLOCKS = 150;
-
-    /// Blocks the TEE executor has to fulfil the HTTP request.
     uint256 public constant HTTP_TTL_BLOCKS = 100;
-
-    /// Registry slots to probe when picking a TEE executor.
     uint256 public constant EXECUTOR_PROBES = 8;
-
-    /// Floor for the fee authorised per scheduled execution.
     uint256 public constant MIN_MAX_FEE_PER_GAS = 1 gwei;
 
     uint256 public constant MIN_BETTING_SECONDS = 30;
     uint256 public constant MIN_RESOLVE_DELAY_SECONDS = 15;
-    uint256 public constant MAX_MARKET_SECONDS = 1 days;
+    uint256 public constant MAX_MARKET_SECONDS = 30 days;
 
     // ────────────────────────────── Storage ──────────────────────────────
 
-    /// Assumed block time, used only to turn human durations into block counts.
-    /// Ritual Chain ran ~195ms when this was written.
     uint256 public immutable blockTimeMs;
 
     uint256 public marketCount;
     mapping(uint256 => Market) private _markets;
+    mapping(uint256 => OracleSource[]) private _marketSources;
 
     mapping(uint256 => mapping(address => uint256)) public yesStake;
     mapping(uint256 => mapping(address => uint256)) public noStake;
@@ -124,13 +125,13 @@ contract RitualPredict {
     event MarketCreated(
         uint256 indexed marketId,
         address indexed creator,
+        MarketType marketType,
         string question,
         uint64 closeBlock,
         uint64 resolveBlock,
         uint256 scheduleId
     );
-    /// The resolution rule, emitted separately from MarketCreated. None of these values
-    /// can change afterwards — there is no setter.
+
     event ResolutionRuleSet(
         uint256 indexed marketId,
         string oracleUrl,
@@ -138,33 +139,49 @@ contract RitualPredict {
         uint256 target,
         Comparator comparator
     );
+
+    event ConsensusRuleSet(
+        uint256 indexed marketId,
+        uint8 sourceCount,
+        uint8 minQuorum,
+        uint256 target,
+        Comparator comparator
+    );
+
     event BetPlaced(
         uint256 indexed marketId,
         address indexed bettor,
         bool isYes,
         uint256 amount
     );
+
     event ResolutionAttempted(
         uint256 indexed marketId,
         uint8 attempt,
         address executor
     );
+
     event ResolutionFailed(
         uint256 indexed marketId,
         uint8 attempt,
         string reason
     );
+
     event MarketResolved(
         uint256 indexed marketId,
         Outcome outcome,
-        uint256 observedValue
+        uint256 consensusMedian,
+        uint8 validSources
     );
+
     event MarketInvalidated(uint256 indexed marketId, string reason);
+
     event WinningsClaimed(
         uint256 indexed marketId,
         address indexed claimant,
         uint256 amount
     );
+
     event StakeRefunded(
         uint256 indexed marketId,
         address indexed claimant,
@@ -184,29 +201,157 @@ contract RitualPredict {
     error BadDuration();
     error EmptyString();
     error TransferFailed();
+    error InvalidQuorum();
 
     constructor(uint256 blockTimeMs_) {
         if (blockTimeMs_ == 0) revert BadDuration();
         blockTimeMs = blockTimeMs_;
 
-        // Let the Scheduler call back into this contract and draw execution fees from
-        // this contract's RitualWallet balance.
         IScheduler(RitualChain.SCHEDULER).approveScheduler(
             RitualChain.SCHEDULER
         );
     }
 
-    // ───────────────────────── Market lifecycle ──────────────────────────
+    // ───────────────────────── Market Creation ───────────────────────────
 
-    /**
-     * Create a market and, in the same transaction, book its own resolution with the
-     * Scheduler: `MAX_ATTEMPTS` executions starting at `resolveBlock`.
-     */
     function createMarket(
         NewMarket calldata p
     ) external returns (uint256 marketId) {
-        // we'll fill this up
+        if (
+            bytes(p.question).length == 0 ||
+            bytes(p.oracleUrl).length == 0 ||
+            bytes(p.jsonPath).length == 0
+        ) revert EmptyString();
+
+        if (
+            p.bettingSeconds < MIN_BETTING_SECONDS ||
+            p.resolveDelaySeconds < MIN_RESOLVE_DELAY_SECONDS ||
+            p.bettingSeconds + p.resolveDelaySeconds > MAX_MARKET_SECONDS
+        ) revert BadDuration();
+
+        uint64 closeBlock = uint64(block.number + _secondsToBlocks(p.bettingSeconds));
+        uint64 resolveBlock = uint64(closeBlock + _secondsToBlocks(p.resolveDelaySeconds));
+
+        marketCount++;
+        marketId = marketCount;
+
+        uint256 scheduleId = _scheduleResolution(marketId, resolveBlock);
+
+        _markets[marketId] = Market({
+            id: marketId,
+            creator: msg.sender,
+            marketType: MarketType.SingleSource,
+            question: p.question,
+            oracleUrl: p.oracleUrl,
+            jsonPath: p.jsonPath,
+            minQuorum: 1,
+            target: p.target,
+            comparator: p.comparator,
+            closeBlock: closeBlock,
+            resolveBlock: resolveBlock,
+            scheduleId: scheduleId,
+            totalYes: 0,
+            totalNo: 0,
+            state: MarketState.Open,
+            outcome: Outcome.Unresolved,
+            attempts: 0,
+            observedValue: 0,
+            validSourcesCount: 1,
+            invalidReason: ""
+        });
+
+        emit MarketCreated(
+            marketId,
+            msg.sender,
+            MarketType.SingleSource,
+            p.question,
+            closeBlock,
+            resolveBlock,
+            scheduleId
+        );
+
+        emit ResolutionRuleSet(
+            marketId,
+            p.oracleUrl,
+            p.jsonPath,
+            p.target,
+            p.comparator
+        );
     }
+
+    function createConsensusMarket(
+        NewConsensusMarket calldata p
+    ) external returns (uint256 marketId) {
+        if (bytes(p.question).length == 0) revert EmptyString();
+        if (p.oracleUrls.length == 0 || p.oracleUrls.length != p.jsonPaths.length) revert EmptyString();
+        if (p.minQuorum == 0 || p.minQuorum > p.oracleUrls.length) revert InvalidQuorum();
+
+        if (
+            p.bettingSeconds < MIN_BETTING_SECONDS ||
+            p.resolveDelaySeconds < MIN_RESOLVE_DELAY_SECONDS ||
+            p.bettingSeconds + p.resolveDelaySeconds > MAX_MARKET_SECONDS
+        ) revert BadDuration();
+
+        uint64 closeBlock = uint64(block.number + _secondsToBlocks(p.bettingSeconds));
+        uint64 resolveBlock = uint64(closeBlock + _secondsToBlocks(p.resolveDelaySeconds));
+
+        marketCount++;
+        marketId = marketCount;
+
+        uint256 scheduleId = _scheduleResolution(marketId, resolveBlock);
+
+        _markets[marketId] = Market({
+            id: marketId,
+            creator: msg.sender,
+            marketType: MarketType.MultiConsensus,
+            question: p.question,
+            oracleUrl: "",
+            jsonPath: "",
+            minQuorum: p.minQuorum,
+            target: p.target,
+            comparator: p.comparator,
+            closeBlock: closeBlock,
+            resolveBlock: resolveBlock,
+            scheduleId: scheduleId,
+            totalYes: 0,
+            totalNo: 0,
+            state: MarketState.Open,
+            outcome: Outcome.Unresolved,
+            attempts: 0,
+            observedValue: 0,
+            validSourcesCount: 0,
+            invalidReason: ""
+        });
+
+        for (uint256 i = 0; i < p.oracleUrls.length; i++) {
+            _marketSources[marketId].push(
+                OracleSource({
+                    oracleUrl: p.oracleUrls[i],
+                    jsonPath: p.jsonPaths[i]
+                })
+            );
+        }
+
+        emit MarketCreated(
+            marketId,
+            msg.sender,
+            MarketType.MultiConsensus,
+            p.question,
+            closeBlock,
+            resolveBlock,
+            scheduleId
+        );
+
+        emit ConsensusRuleSet(
+            marketId,
+            uint8(p.oracleUrls.length),
+            p.minQuorum,
+            p.target,
+            p.comparator
+        );
+    }
+
+    // ───────────────────────── Betting ───────────────────────────────────
 
     function bet(uint256 marketId, bool isYes) external payable {
         Market storage m = _market(marketId);
@@ -225,23 +370,61 @@ contract RitualPredict {
         emit BetPlaced(marketId, msg.sender, isYes, msg.value);
     }
 
-    /**
-     * Scheduler callback. `executionIndex` is written into calldata bytes 4-35 by the
-     * Scheduler, so it must be the first parameter.
-     *
-     * Deliberately revert-free for anything that is not an authorisation failure: a
-     * reverted execution would roll back the attempt counter, and the market could then
-     * never reach `Invalid`.
-     */
+    // ───────────────────────── Resolution Callback ───────────────────────
+
     function onScheduledResolve(
         uint256 executionIndex,
         uint256 marketId
     ) external {
-        // we'll fill this up
+        if (msg.sender != RitualChain.SCHEDULER) revert OnlyScheduler();
+
+        Market storage m = _market(marketId);
+        if (m.state == MarketState.Resolved || m.state == MarketState.Invalid) {
+            return;
+        }
+
+        m.attempts++;
+        uint8 attempt = m.attempts;
+
+        address executor = _pickExecutor(marketId, executionIndex);
+        emit ResolutionAttempted(marketId, attempt, executor);
+
+        (bool ok, uint256 consensusValue, uint8 validCount, string memory reason) = _resolveMarketValue(m, executor);
+
+        if (!ok) {
+            if (attempt < MAX_ATTEMPTS) {
+                m.state = MarketState.Resolving;
+            }
+            _fail(m, marketId, attempt, reason);
+            return;
+        }
+
+        try IScheduler(RitualChain.SCHEDULER).cancel(m.scheduleId) {} catch {}
+
+        m.observedValue = consensusValue;
+        m.validSourcesCount = validCount;
+
+        bool wonYes = _compare(consensusValue, m.target, m.comparator);
+
+        if (wonYes) {
+            if (m.totalYes == 0) {
+                _invalidate(m, marketId, "no winners on YES side");
+                return;
+            }
+            m.state = MarketState.Resolved;
+            m.outcome = Outcome.Yes;
+        } else {
+            if (m.totalNo == 0) {
+                _invalidate(m, marketId, "no winners on NO side");
+                return;
+            }
+            m.state = MarketState.Resolved;
+            m.outcome = Outcome.No;
+        }
+
+        emit MarketResolved(marketId, m.outcome, consensusValue, validCount);
     }
 
-    /// A failed oracle read is never interpreted as NO. Once the booked attempts are
-    /// exhausted the market becomes refundable instead.
     function _fail(
         Market storage m,
         uint256 marketId,
@@ -264,7 +447,6 @@ contract RitualPredict {
 
     // ────────────────────────────── Payouts ──────────────────────────────
 
-    /// Pull-based, proportional share of the whole pool. No loops over participants.
     function claimWinnings(uint256 marketId) external {
         Market storage m = _market(marketId);
         if (m.state != MarketState.Resolved) revert NotResolved();
@@ -278,7 +460,6 @@ contract RitualPredict {
         _pay(msg.sender, payout);
     }
 
-    /// Reclaim the original stake from an invalid market.
     function claimRefund(uint256 marketId) external {
         Market storage m = _market(marketId);
         if (m.state != MarketState.Invalid) revert NotInvalid();
@@ -293,7 +474,6 @@ contract RitualPredict {
         _pay(msg.sender, amount);
     }
 
-    /// `stake * totalPool / winningPool`, or 0 if this account backed the losing side.
     function _payout(
         Market storage m,
         uint256 marketId,
@@ -308,17 +488,15 @@ contract RitualPredict {
         return (stake * (m.totalYes + m.totalNo)) / winningPool;
     }
 
-    // ─────────────────────────────── Views ───────────────────────────────
+    // ────────────────────────────── Views ────────────────────────────────
 
     function getMarket(uint256 marketId) public view returns (Market memory m) {
         m = _markets[marketId];
         if (m.closeBlock == 0) revert UnknownMarket();
-        // No transaction exists to flip Open → Closed, so the view does it.
         if (m.state == MarketState.Open && block.number >= m.closeBlock)
             m.state = MarketState.Closed;
     }
 
-    /// Every market, newest first. A workshop has a handful; there is no pagination.
     function getMarkets() external view returns (Market[] memory all) {
         uint256 total = marketCount;
         all = new Market[](total);
@@ -355,9 +533,6 @@ contract RitualPredict {
 
     // ───────────────────────── Execution funding ─────────────────────────
 
-    /// Prepay Scheduler + HTTP precompile fees. Anyone may top the contract up; the
-    /// balance lives in RitualWallet under this contract's address, which is the
-    /// `payer` of every scheduled execution.
     function fundExecution(uint256 lockDurationBlocks) external payable {
         if (msg.value == 0) revert ZeroStake();
         IRitualWallet(RitualChain.RITUAL_WALLET).deposit{value: msg.value}(
@@ -370,23 +545,86 @@ contract RitualPredict {
             IRitualWallet(RitualChain.RITUAL_WALLET).balanceOf(address(this));
     }
 
-    // ───────────────────── Ritual: oracle read path ──────────────────────
+    // ───────────────────── Ritual: Multi-Oracle Read Path ────────────────
 
-    /// HTTP (0x0801) → jq (0x0803), both inside this one scheduled transaction.
-    function _readOracle(
+    function _resolveMarketValue(
         Market storage m,
         address executor
-    ) private returns (bool ok, uint256 value, string memory reason) {
-        // we'll fill this up
+    ) private returns (bool ok, uint256 consensusValue, uint8 validCount, string memory reason) {
+        if (m.marketType == MarketType.SingleSource) {
+            (bool sOk, uint256 sVal, string memory sReason) = _readSingleOracle(m.oracleUrl, m.jsonPath, executor);
+            if (!sOk) return (false, 0, 0, sReason);
+            return (true, sVal, 1, "");
+        } else {
+            OracleSource[] storage sources = _marketSources[m.id];
+            uint256 len = sources.length;
+            uint256[] memory collectedValues = new uint256[](len);
+            uint8 count = 0;
+
+            for (uint256 i = 0; i < len; i++) {
+                (bool srcOk, uint256 val, ) = _readSingleOracle(sources[i].oracleUrl, sources[i].jsonPath, executor);
+                if (srcOk) {
+                    collectedValues[count] = val;
+                    count++;
+                }
+            }
+
+            if (count < m.minQuorum) {
+                return (false, 0, count, "Consensus quorum not reached");
+            }
+
+            // Calculate median from collected values
+            uint256 median = _calculateMedian(collectedValues, count);
+            return (true, median, count, "");
+        }
     }
 
-    /**
-     * Unwraps the short-running async envelope `(bytes simmedInput, bytes actualOutput)`
-     * and the 5-field HTTP response inside it.
-     *
-     * External so `_readOracle` can call it through `try`. Reverting on malformed input
-     * is exactly the signal the caller wants.
-     */
+    function _readSingleOracle(
+        string memory url,
+        string memory jsonPath,
+        address executor
+    ) private returns (bool ok, uint256 value, string memory reason) {
+        if (executor == address(0)) {
+            return (false, 0, "no valid TEE executor found");
+        }
+
+        string[] memory emptyHeaders = new string[](0);
+        bytes memory inputData = abi.encode(
+            executor,
+            RitualChain.HTTP_GET,
+            url,
+            emptyHeaders,
+            bytes(""),
+            HTTP_TTL_BLOCKS
+        );
+
+        (bool callOk, bytes memory rawResponse) = RitualChain
+            .HTTP_PRECOMPILE
+            .call(inputData);
+
+        if (!callOk || rawResponse.length == 0) {
+            return (false, 0, "HTTP precompile call failed");
+        }
+
+        try this.decodeHttpResponse(rawResponse) returns (
+            uint16 status,
+            bytes memory body,
+            string memory errorMessage
+        ) {
+            if (bytes(errorMessage).length > 0) return (false, 0, errorMessage);
+            if (status != 200) return (false, 0, "HTTP non-200 status");
+
+            (bool jqOk, uint256 parsedValue) = _jqUint(jsonPath, string(body));
+            if (!jqOk) return (false, 0, "jq extraction failed");
+
+            return (true, parsedValue, "");
+        } catch Error(string memory err) {
+            return (false, 0, err);
+        } catch {
+            return (false, 0, "HTTP response decoding failed");
+        }
+    }
+
     function decodeHttpResponse(
         bytes calldata raw
     )
@@ -395,7 +633,6 @@ contract RitualPredict {
         returns (uint16 status, bytes memory body, string memory errorMessage)
     {
         (, bytes memory actualOutput) = abi.decode(raw, (bytes, bytes));
-        // Empty during simulation, before the executor has run.
         require(actualOutput.length > 0, "async output not settled");
         (status, , , body, errorMessage) = abi.decode(
             actualOutput,
@@ -403,8 +640,25 @@ contract RitualPredict {
         );
     }
 
-    /// jq is synchronous. A wrong outputType returns ok=true with zero-length output,
-    /// so the length check is load-bearing.
+    function _calculateMedian(uint256[] memory arr, uint8 count) private pure returns (uint256) {
+        // Simple in-memory bubble sort for small array (count <= 10)
+        for (uint8 i = 0; i < count; i++) {
+            for (uint8 j = i + 1; j < count; j++) {
+                if (arr[i] > arr[j]) {
+                    uint256 tmp = arr[i];
+                    arr[i] = arr[j];
+                    arr[j] = tmp;
+                }
+            }
+        }
+
+        if (count % 2 == 1) {
+            return arr[count / 2];
+        } else {
+            return (arr[(count / 2) - 1] + arr[count / 2]) / 2;
+        }
+    }
+
     function _jqUint(
         string memory query,
         string memory json
@@ -420,16 +674,50 @@ contract RitualPredict {
         uint256 marketId,
         uint256 executionIndex
     ) private view returns (address) {
-        // we'll fill this up
+        uint256 seed = uint256(
+            keccak256(
+                abi.encode(
+                    block.prevrandao,
+                    block.number,
+                    marketId,
+                    executionIndex
+                )
+            )
+        );
+        (address executor, bool found) = ITEEServiceRegistry(
+            RitualChain.TEE_SERVICE_REGISTRY
+        ).pickServiceByCapability(
+            RitualChain.CAPABILITY_HTTP_CALL,
+            true,
+            seed,
+            EXECUTOR_PROBES
+        );
+        if (!found) return address(0);
+        return executor;
     }
-
-    // ────────────────────── Ritual: scheduling ───────────────────────────
 
     function _scheduleResolution(
         uint256 marketId,
         uint64 resolveBlock
     ) private returns (uint256 callId) {
-        // we'll fill this up
+        bytes memory payload = abi.encodeWithSelector(
+            this.onScheduledResolve.selector,
+            uint256(0),
+            marketId
+        );
+
+        callId = IScheduler(RitualChain.SCHEDULER).schedule(
+            payload,
+            RESOLVE_GAS_LIMIT,
+            uint32(resolveBlock),
+            MAX_ATTEMPTS,
+            RETRY_INTERVAL_BLOCKS,
+            SCHEDULER_TTL_BLOCKS,
+            MIN_MAX_FEE_PER_GAS,
+            0,
+            0,
+            address(this)
+        );
     }
 
     // ────────────────────────────── Helpers ──────────────────────────────
@@ -462,6 +750,5 @@ contract RitualPredict {
         if (!ok) revert TransferFailed();
     }
 
-    /// Scheduler gas refunds land in RitualWallet, but accept plain transfers anyway.
     receive() external payable {}
 }

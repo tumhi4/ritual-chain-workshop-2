@@ -8,6 +8,7 @@ export default defineConfig({
       default: {
         version: "0.8.28",
         settings: {
+          viaIR: true,
           optimizer: {
             enabled: true,
             runs: 200,
@@ -17,6 +18,7 @@ export default defineConfig({
       production: {
         version: "0.8.28",
         settings: {
+          viaIR: true,
           optimizer: {
             enabled: true,
             runs: 200,
@@ -30,8 +32,11 @@ export default defineConfig({
       type: "edr-simulated",
       chainType: "l1",
     },
-    // Ritual Chain testnet. Requires EIP-1559 (type-2) transactions; viem sends
-    // those by default.
+    localhost: {
+      type: "http",
+      chainType: "l1",
+      url: "http://127.0.0.1:8545",
+    },
     ritual: {
       type: "http",
       chainType: "l1",
